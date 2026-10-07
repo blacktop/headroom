@@ -1,0 +1,63 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+version: 2
+project_name: headroom
+
+builds:
+  - id: headroom-macos
+    builder: rust
+    binary: headroom
+    command: build
+    flags:
+      - --release
+      - --locked
+    targets:
+      - aarch64-apple-darwin
+      - x86_64-apple-darwin
+    hooks:
+      post:
+        - cmd: sh .github/scripts/check-release-binary.sh "{{ .Path }}" "{{ .Target }}"
+
+archives:
+  - id: macos
+    ids:
+      - headroom-macos
+    formats:
+      - tar.gz
+    name_template: 'headroom_{{ .Version }}_Darwin_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
+    files:
+      - README.md
+      - LICENSE
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: github
+
+release:
+  github:
+    owner: blacktop
+    name: headroom
+  prerelease: auto
+
+homebrew_casks:
+  - name: headroom
+    ids:
+      - macos
+    binaries:
+      - headroom
+    repository:
+      owner: blacktop
+      name: homebrew-tap
+      branch: master
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    skip_upload: auto
+    homepage: https://github.com/blacktop/headroom
+    description: Read-only macOS worker admission check
+    license: MIT
+    custom_block: |
+      postflight_steps do
+        on_macos do
+          run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ "{{staged_path}}" }}/headroom"]
+        end
+      end
