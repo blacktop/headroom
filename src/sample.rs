@@ -4,15 +4,27 @@ use std::mem::{MaybeUninit, offset_of, size_of};
 use std::ptr;
 
 use mach2::host_info::HOST_VM_INFO64_COUNT;
-use mach2::kern_return::KERN_SUCCESS;
+use mach2::kern_return::{KERN_SUCCESS, kern_return_t};
 use mach2::mach_init::mach_host_self;
 use mach2::mach_port::mach_port_deallocate;
+use mach2::mach_types::host_t;
+use mach2::message::mach_msg_type_number_t;
 use mach2::port::MACH_PORT_NULL;
 use mach2::traps::mach_task_self;
 use mach2::vm_statistics::vm_statistics64;
 use mach2::vm_types::integer_t;
 
 use crate::model::{PressureLevel, ReadError, Sample, ThermalLevel, VmCounters};
+
+// SDK mach/mach_host.h. mach2 does not expose this public libSystem routine.
+unsafe extern "C" {
+    fn host_statistics(
+        host: host_t,
+        flavor: integer_t,
+        info: *mut integer_t,
+        count: *mut mach_msg_type_number_t,
+    ) -> kern_return_t;
+}
 
 // SDK notify.h. These three symbols are public libSystem interfaces.
 unsafe extern "C" {
@@ -23,6 +35,7 @@ unsafe extern "C" {
 
 pub(crate) fn take() -> Sample {
     Sample {
+        cpu_ticks: cpu_ticks(),
         load: load(),
         ncpu: ncpu(),
         mem_total_bytes: mem_total_bytes(),
@@ -123,6 +136,43 @@ fn load() -> Result<[f64; 3], ReadError> {
     } else {
         Ok(values)
     }
+}
+
+fn cpu_ticks() -> Result<[u32; 4], ReadError> {
+    let mut info = libc::host_cpu_load_info { cpu_ticks: [0; 4] };
+    let mut count = libc::HOST_CPU_LOAD_INFO_COUNT;
+    // SAFETY: This no-argument Mach trap returns a send right owned by this
+    // task; it takes no pointers and cannot unwind across the C ABI.
+    let host = unsafe { mach_host_self() };
+    if host == MACH_PORT_NULL {
+        return Err(ReadError::Invalid("mach_host_self returned a null port"));
+    }
+    // SAFETY: host is our live send right. libc's SDK-layout buffer contains
+    // four initialized natural_t counters and is aligned and exclusive. Its
+    // integer-word capacity is passed to Mach. The synchronous C call retains
+    // neither output pointer and cannot unwind.
+    let result = unsafe {
+        host_statistics(
+            host,
+            libc::HOST_CPU_LOAD_INFO,
+            (&raw mut info).cast(),
+            &raw mut count,
+        )
+    };
+    // SAFETY: mach_task_self is borrowed; host is the owned send-right
+    // reference acquired above. Release it exactly once after the read, on
+    // success and failure. No pointers escape and the C call cannot unwind.
+    let released = unsafe { mach_port_deallocate(mach_task_self(), host) };
+    if result != KERN_SUCCESS {
+        return Err(status("host_statistics CPU load", result));
+    }
+    if released != KERN_SUCCESS {
+        return Err(status("mach_port_deallocate", released));
+    }
+    if count != libc::HOST_CPU_LOAD_INFO_COUNT {
+        return Err(ReadError::Invalid("incomplete CPU statistics"));
+    }
+    Ok(info.cpu_ticks)
 }
 
 fn vm() -> Result<VmCounters, ReadError> {

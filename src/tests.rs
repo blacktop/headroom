@@ -24,6 +24,7 @@ fn vm(sample: &mut Sample) -> Result<&mut VmCounters, ReadError> {
 
 fn sample() -> Sample {
     Sample {
+        cpu_ticks: Ok([0; 4]),
         load: Ok([4.0, 6.0, 12.0]),
         ncpu: Ok(16),
         mem_total_bytes: Ok(16_384_000),
@@ -43,6 +44,13 @@ fn sample() -> Sample {
     }
 }
 
+fn after_sample() -> Sample {
+    Sample {
+        cpu_ticks: Ok([30, 20, 25, 25]),
+        ..sample()
+    }
+}
+
 fn denied() -> ReadError {
     ReadError::Os {
         operation: "injected read",
@@ -51,9 +59,38 @@ fn denied() -> ReadError {
 }
 
 #[test]
-fn load_threshold_is_strict_and_configurable() {
+fn cpu_threshold_is_strict_and_configurable() {
     let before = sample();
-    let mut after = sample();
+    let mut after = after_sample();
+    after.load = Ok([32.0, 40.0, 60.0]);
+    for (ticks, ratio, expected) in [
+        ([0, 0, 100, 0], 0.0, Verdict::Admit),
+        ([30, 20, 25, 25], 0.75, Verdict::Admit),
+        ([70, 10, 10, 10], 0.90, Verdict::Admit),
+        ([71, 10, 9, 10], 0.91, Verdict::Refuse),
+        ([80, 10, 0, 10], 1.0, Verdict::Refuse),
+    ] {
+        after.cpu_ticks = Ok(ticks);
+        let report = evaluate(&before, &after, &Limits::default());
+        assert_eq!(report.verdict, expected);
+        assert_eq!(report.cpu_busy_ratio, Some(ratio));
+    }
+    assert_eq!(
+        evaluate(&before, &after, &Limits::default()).reasons,
+        ["cpu busy 1.00 > 0.90"]
+    );
+    let limits = Limits {
+        max_cpu_busy: 1.0,
+        ..Limits::default()
+    };
+    assert_eq!(evaluate(&before, &after, &limits).verdict, Verdict::Admit);
+}
+
+#[test]
+fn load_fallback_is_strict_and_configurable() {
+    let before = sample();
+    let mut after = after_sample();
+    after.cpu_ticks = Err(denied());
     after.load = Ok([16.0, 20.0, 30.0]);
     assert_eq!(
         evaluate(&before, &after, &Limits::default()).verdict,
@@ -71,6 +108,57 @@ fn load_threshold_is_strict_and_configurable() {
 }
 
 #[test]
+fn either_unavailable_cpu_sample_uses_load_fallback() {
+    for first_missing in [true, false] {
+        let mut before = sample();
+        let mut after = after_sample();
+        if first_missing {
+            before.cpu_ticks = Err(denied());
+        } else {
+            after.cpu_ticks = Err(denied());
+        }
+        let report = evaluate(&before, &after, &Limits::default());
+        assert_eq!(report.verdict, Verdict::Admit);
+        assert_eq!(report.cpu_busy_ratio, None);
+        after.load = Ok([32.0, 0.0, 0.0]);
+        let report = evaluate(&before, &after, &Limits::default());
+        assert_eq!(report.verdict, Verdict::Refuse);
+        assert_eq!(report.reasons, ["load per core 2.00 > 1"]);
+    }
+}
+
+#[test]
+fn zero_cpu_delta_is_unavailable_and_uses_load_fallback() {
+    let before = sample();
+    let mut after = sample();
+    let report = evaluate(&before, &after, &Limits::default());
+    assert_eq!(report.cpu_busy_ratio, None);
+    assert_eq!(report.verdict, Verdict::Admit);
+    after.load = Ok([32.0, 0.0, 0.0]);
+    let report = evaluate(&before, &after, &Limits::default());
+    assert_eq!(report.verdict, Verdict::Refuse);
+    assert_eq!(report.cpu_busy_ratio, None);
+}
+
+#[test]
+fn cpu_tick_wrap_and_wide_totals_preserve_the_ratio() {
+    let mut before = sample();
+    before.cpu_ticks = Ok([u32::MAX - 9; 4]);
+    let mut after = after_sample();
+    after.cpu_ticks = Ok([0; 4]);
+    assert_eq!(
+        evaluate(&before, &after, &Limits::default()).cpu_busy_ratio,
+        Some(0.75)
+    );
+    before.cpu_ticks = Ok([0; 4]);
+    after.cpu_ticks = Ok([u32::MAX; 4]);
+    assert_eq!(
+        evaluate(&before, &after, &Limits::default()).cpu_busy_ratio,
+        Some(0.75)
+    );
+}
+
+#[test]
 fn thermal_threshold_is_inclusive_and_configurable() {
     for (level, expected) in [
         (ThermalLevel::Nominal, Verdict::Admit),
@@ -79,14 +167,14 @@ fn thermal_threshold_is_inclusive_and_configurable() {
         (ThermalLevel::Trapping, Verdict::Refuse),
         (ThermalLevel::Sleeping, Verdict::Refuse),
     ] {
-        let mut after = sample();
+        let mut after = after_sample();
         after.thermal = Ok(level);
         assert_eq!(
             evaluate(&sample(), &after, &Limits::default()).verdict,
             expected
         );
     }
-    let mut after = sample();
+    let mut after = after_sample();
     after.thermal = Ok(ThermalLevel::Heavy);
     let limits = Limits {
         max_thermal: ThermalLevel::Trapping,
@@ -102,14 +190,14 @@ fn pressure_threshold_is_inclusive_and_configurable() {
         (PressureLevel::Warn, Verdict::Refuse),
         (PressureLevel::Critical, Verdict::Refuse),
     ] {
-        let mut after = sample();
+        let mut after = after_sample();
         after.pressure = Some(level);
         assert_eq!(
             evaluate(&sample(), &after, &Limits::default()).verdict,
             expected
         );
     }
-    let mut after = sample();
+    let mut after = after_sample();
     after.pressure = Some(PressureLevel::Warn);
     let limits = Limits {
         max_pressure: PressureLevel::Critical,
@@ -120,7 +208,7 @@ fn pressure_threshold_is_inclusive_and_configurable() {
 
 #[test]
 fn swapping_can_be_allowed_without_hiding_the_delta() -> TestResult {
-    let mut after = sample();
+    let mut after = after_sample();
     vm(&mut after)?.swapouts = 23;
     let report = evaluate(&sample(), &after, &Limits::default());
     assert_eq!(report.verdict, Verdict::Refuse);
@@ -137,10 +225,11 @@ fn swapping_can_be_allowed_without_hiding_the_delta() -> TestResult {
 
 #[test]
 fn every_triggered_reason_is_reported_in_severity_order() -> TestResult {
-    let mut after = sample();
+    let mut after = after_sample();
     after.thermal = Ok(ThermalLevel::Sleeping);
     after.pressure = Some(PressureLevel::Critical);
     vm(&mut after)?.swapouts = 25;
+    after.cpu_ticks = Ok([75, 10, 5, 10]);
     after.load = Ok([32.0, 0.0, 0.0]);
     let report = evaluate(&sample(), &after, &Limits::default());
     assert_eq!(report.verdict, Verdict::Refuse);
@@ -150,7 +239,7 @@ fn every_triggered_reason_is_reported_in_severity_order() -> TestResult {
             "thermal sleeping >= heavy",
             "memory pressure critical >= warn",
             "swapouts increased by 3",
-            "load per core 2.00 > 1",
+            "cpu busy 0.95 > 0.90",
         ]
     );
     Ok(())
@@ -161,7 +250,7 @@ fn either_required_sample_being_unavailable_is_unknown() {
     for first_missing in [true, false] {
         for field in 0..5 {
             let mut before = sample();
-            let mut after = sample();
+            let mut after = after_sample();
             let target = if first_missing {
                 &mut before
             } else {
@@ -192,7 +281,7 @@ fn either_required_sample_being_unavailable_is_unknown() {
 
 #[test]
 fn unavailable_required_evidence_takes_precedence_over_known_refusals() {
-    let mut after = sample();
+    let mut after = after_sample();
     after.load = Err(denied());
     after.thermal = Ok(ThermalLevel::Heavy);
     let report = evaluate(&sample(), &after, &Limits::default());
@@ -208,7 +297,7 @@ fn unavailable_required_evidence_takes_precedence_over_known_refusals() {
 #[test]
 fn malformed_external_numbers_are_unknown() -> TestResult {
     for case in 0..11 {
-        let mut after = sample();
+        let mut after = after_sample();
         match case {
             0 => after.ncpu = Ok(0),
             1 => after.mem_total_bytes = Ok(0),
@@ -233,7 +322,7 @@ fn malformed_external_numbers_are_unknown() -> TestResult {
 
 #[test]
 fn free_memory_estimate_is_bounded_when_vm_categories_overlap() -> TestResult {
-    let mut after = sample();
+    let mut after = after_sample();
     vm(&mut after)?.free_count = 1_000;
     let report = evaluate(&sample(), &after, &Limits::default());
     assert_eq!(report.verdict, Verdict::Admit);
@@ -274,7 +363,7 @@ fn pressure_values_are_the_kernel_levels() -> TestResult {
 #[test]
 fn mach_binding_fields_match_the_sdk_contract() {
     use mach2::vm_statistics::vm_statistics64;
-    use std::mem::offset_of;
+    use std::mem::{align_of, offset_of, size_of};
 
     // The companion C assertions in tests/sdk_contract.m use these same
     // offsets against the installed SDK, including the minimum reply size.
@@ -286,17 +375,33 @@ fn mach_binding_fields_match_the_sdk_contract() {
     assert_eq!(offset_of!(vm_statistics64, swapouts), 120);
     assert_eq!(offset_of!(vm_statistics64, compressor_page_count), 128);
     assert_eq!(offset_of!(vm_statistics64, swapped_count), 152);
+    assert_eq!(libc::HOST_CPU_LOAD_INFO, 3);
+    assert_eq!(libc::HOST_CPU_LOAD_INFO_COUNT, 4);
+    assert_eq!(libc::CPU_STATE_MAX, 4);
+    assert_eq!(
+        [
+            libc::CPU_STATE_USER,
+            libc::CPU_STATE_SYSTEM,
+            libc::CPU_STATE_IDLE,
+            libc::CPU_STATE_NICE,
+        ],
+        [0, 1, 2, 3]
+    );
+    assert_eq!(size_of::<libc::host_cpu_load_info>(), 16);
+    assert_eq!(align_of::<libc::host_cpu_load_info>(), 4);
+    assert_eq!(offset_of!(libc::host_cpu_load_info, cpu_ticks), 0);
 }
 
 #[test]
 fn text_report_has_the_documented_keys_order_and_precision() -> TestResult {
-    let report = evaluate(&sample(), &sample(), &Limits::default());
+    let report = evaluate(&sample(), &after_sample(), &Limits::default());
     let mut output = Vec::new();
     crate::render::write(&mut output, &report, Format::Text)?;
     assert_eq!(
         String::from_utf8(output)?,
         concat!(
-            "ADMIT: load 4.0 on 16 cores, memory free 0.50, thermal nominal\n",
+            "ADMIT: cpu busy 0.75, load 4.0 on 16 cores, memory free 0.50, thermal nominal\n",
+            "cpu_busy_ratio: 0.75\n",
             "load1_per_core: 0.25\nload1: 4.0\nload5: 6.0\nload15: 12.0\n",
             "ncpu: 16\nmem_total_bytes: 16384000\nmem_free_ratio: 0.50\n",
             "compressor_bytes: 1638400\nswapouts_delta: 0\nswap_used_bytes: null\n",
@@ -308,7 +413,7 @@ fn text_report_has_the_documented_keys_order_and_precision() -> TestResult {
 
 #[test]
 fn json_report_is_one_flat_versioned_object_with_exact_integers() -> TestResult {
-    let mut after = sample();
+    let mut after = after_sample();
     after.swap_used_bytes = Some(9_007_199_254_740_993);
     after.pressure = Some(PressureLevel::Normal);
     let report = evaluate(&sample(), &after, &Limits::default());
@@ -319,7 +424,8 @@ fn json_report_is_one_flat_versioned_object_with_exact_integers() -> TestResult 
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&text)?,
         json!({
-            "schema": 1, "verdict": "ADMIT", "reasons": [],
+            "schema": 2, "verdict": "ADMIT", "reasons": [],
+            "cpu_busy_ratio": 0.75,
             "load1_per_core": 0.25, "load1": 4.0, "load5": 6.0, "load15": 12.0,
             "ncpu": 16, "mem_total_bytes": 16_384_000, "mem_free_ratio": 0.5,
             "compressor_bytes": 1_638_400, "swapouts_delta": 0,
@@ -332,7 +438,7 @@ fn json_report_is_one_flat_versioned_object_with_exact_integers() -> TestResult 
 
 #[test]
 fn unknown_output_keeps_missing_fields_null() -> TestResult {
-    let mut after = sample();
+    let mut after = after_sample();
     after.load = Err(ReadError::Invalid("injected failure"));
     let report = evaluate(&sample(), &after, &Limits::default());
     let mut output = Vec::new();
@@ -347,7 +453,7 @@ fn unknown_output_keeps_missing_fields_null() -> TestResult {
 
 #[test]
 fn refusal_text_first_line_contains_all_reasons() -> TestResult {
-    let mut after = sample();
+    let mut after = after_sample();
     after.thermal = Ok(ThermalLevel::Heavy);
     after.pressure = Some(PressureLevel::Warn);
     let report = evaluate(&sample(), &after, &Limits::default());
@@ -361,10 +467,46 @@ fn refusal_text_first_line_contains_all_reasons() -> TestResult {
 }
 
 #[test]
+fn verdict_text_identifies_the_load_fallback() -> TestResult {
+    let mut after = after_sample();
+    after.cpu_ticks = Err(denied());
+    for (load, thermal, expected) in [
+        (
+            Ok([4.0, 6.0, 12.0]),
+            Ok(ThermalLevel::Nominal),
+            "ADMIT: cpu busy null, load 4.0 on 16 cores, memory free 0.50, thermal nominal; cpu ticks unavailable, using load fallback",
+        ),
+        (
+            Ok([32.0, 0.0, 0.0]),
+            Ok(ThermalLevel::Nominal),
+            "REFUSE: load per core 2.00 > 1; cpu ticks unavailable, using load fallback",
+        ),
+        (
+            Ok([4.0, 6.0, 12.0]),
+            Err(ReadError::Invalid("injected failure")),
+            "UNKNOWN: second thermal state unavailable: injected failure; cpu ticks unavailable, using load fallback",
+        ),
+    ] {
+        after.load = load;
+        after.thermal = thermal;
+        let report = evaluate(&sample(), &after, &Limits::default());
+        let mut output = Vec::new();
+        crate::render::write(&mut output, &report, Format::Text)?;
+        let text = String::from_utf8(output)?;
+        assert_eq!(text.lines().next(), Some(expected));
+        assert!(text.contains("\ncpu_busy_ratio: null\n"));
+        let json = serde_json::to_value(report)?;
+        assert_eq!(json.get("cpu_busy_ratio"), Some(&serde_json::Value::Null));
+    }
+    Ok(())
+}
+
+#[test]
 fn cli_defaults_match_the_rule_defaults() -> TestResult {
     let cli = Cli::try_parse_from(["headroom"])?;
     let limits = Limits::default();
     assert_eq!(cli.format, Format::Text);
+    assert!((cli.max_cpu_busy - limits.max_cpu_busy).abs() < f64::EPSILON);
     assert!((cli.max_load_per_core - limits.max_load_per_core).abs() < f64::EPSILON);
     assert_eq!(cli.max_thermal, limits.max_thermal);
     assert_eq!(cli.max_pressure, limits.max_pressure);
@@ -378,6 +520,10 @@ fn cli_rejects_unknown_flags_and_invalid_thresholds() {
         vec!["headroom", "--unknown"],
         vec!["headroom", "positional"],
         vec!["headroom", "--format", "xml"],
+        vec!["headroom", "--max-cpu-busy=NaN"],
+        vec!["headroom", "--max-cpu-busy=inf"],
+        vec!["headroom", "--max-cpu-busy=-0.1"],
+        vec!["headroom", "--max-cpu-busy=1.1"],
         vec!["headroom", "--max-load-per-core=NaN"],
         vec!["headroom", "--max-load-per-core=inf"],
         vec!["headroom", "--max-load-per-core=-1"],
@@ -398,6 +544,8 @@ fn cli_accepts_every_documented_threshold_flag() -> TestResult {
         "headroom",
         "--format",
         "json",
+        "--max-cpu-busy",
+        "0.8",
         "--max-load-per-core",
         "2.5",
         "--max-thermal",
@@ -410,6 +558,7 @@ fn cli_accepts_every_documented_threshold_flag() -> TestResult {
     assert_eq!(cli.max_thermal, ThermalLevel::Sleeping);
     assert_eq!(cli.max_pressure, PressureLevel::Critical);
     assert!(cli.allow_swapping);
+    assert!((cli.max_cpu_busy - 0.8).abs() < f64::EPSILON);
     assert!((cli.max_load_per_core - 2.5).abs() < f64::EPSILON);
     Ok(())
 }

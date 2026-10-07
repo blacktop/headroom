@@ -3,6 +3,7 @@
 #import <Foundation/NSProcessInfo.h>
 #include <libkern/OSThermalNotification.h>
 #include <mach/host_info.h>
+#include <mach/machine.h>
 #include <mach/vm_statistics.h>
 #include <stddef.h>
 
@@ -15,6 +16,15 @@ _Static_assert(NSProcessInfoThermalStateNominal == 0, "normal semantics");
 _Static_assert(NSProcessInfoThermalStateFair == 1, "slightly elevated semantics");
 _Static_assert(NSProcessInfoThermalStateSerious == 2, "high temperature semantics");
 _Static_assert(NSProcessInfoThermalStateCritical == 3, "must cool semantics");
+_Static_assert(HOST_CPU_LOAD_INFO == 3, "CPU flavor ABI");
+_Static_assert(HOST_CPU_LOAD_INFO_COUNT == 4, "CPU word count");
+_Static_assert(CPU_STATE_MAX == 4, "CPU state count");
+_Static_assert(CPU_STATE_USER == 0 && CPU_STATE_SYSTEM == 1 &&
+               CPU_STATE_IDLE == 2 && CPU_STATE_NICE == 3, "CPU state order");
+_Static_assert(sizeof(natural_t) == 4, "CPU tick width");
+_Static_assert(sizeof(host_cpu_load_info_data_t) == 16, "CPU buffer size");
+_Static_assert(_Alignof(host_cpu_load_info_data_t) == 4, "CPU buffer alignment");
+_Static_assert(offsetof(host_cpu_load_info_data_t, cpu_ticks) == 0, "CPU ticks ABI");
 _Static_assert(HOST_VM_INFO64 == 4, "VM flavor ABI");
 _Static_assert(offsetof(vm_statistics64_data_t, free_count) == 0, "free ABI");
 _Static_assert(offsetof(vm_statistics64_data_t, inactive_count) == 8, "inactive ABI");

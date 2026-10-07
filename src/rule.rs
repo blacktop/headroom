@@ -2,6 +2,7 @@ use crate::model::{PressureLevel, ReadError, Report, Sample, ThermalLevel, Verdi
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Limits {
+    pub(crate) max_cpu_busy: f64,
     pub(crate) max_load_per_core: f64,
     pub(crate) max_thermal: ThermalLevel,
     pub(crate) max_pressure: PressureLevel,
@@ -11,6 +12,7 @@ pub(crate) struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
+            max_cpu_busy: 0.90,
             max_load_per_core: 1.0,
             max_thermal: ThermalLevel::Heavy,
             max_pressure: PressureLevel::Warn,
@@ -131,11 +133,24 @@ fn swap_delta(before: &Evidence, after: &Evidence, unavailable: &mut Vec<String>
     })
 }
 
+fn cpu_busy_ratio(before: &Sample, after: &Sample) -> Option<f64> {
+    let [first_user, first_system, first_idle, first_nice] = *before.cpu_ticks.as_ref().ok()?;
+    let [user, system, idle, nice] = *after.cpu_ticks.as_ref().ok()?;
+    // HOST_CPU_LOAD_INFO uses wrapping 32-bit tick counters. Widen each delta
+    // before summing so even a full wrap in every category fits safely.
+    let busy = u64::from(user.wrapping_sub(first_user))
+        .checked_add(u64::from(system.wrapping_sub(first_system)))?
+        .checked_add(u64::from(nice.wrapping_sub(first_nice)))?;
+    let total = busy.checked_add(u64::from(idle.wrapping_sub(first_idle)))?;
+    (total != 0).then(|| fraction(busy, total))
+}
+
 pub(crate) fn evaluate(before: &Sample, after: &Sample, limits: &Limits) -> Report {
     let mut reasons = Vec::new();
     let first = Evidence::read(before, "first", &mut reasons);
     let latest = Evidence::read(after, "second", &mut reasons);
     let delta = swap_delta(&first, &latest, &mut reasons);
+    let cpu_busy_ratio = cpu_busy_ratio(before, after);
     let load1_per_core = latest
         .load
         .zip(latest.ncpu)
@@ -145,6 +160,7 @@ pub(crate) fn evaluate(before: &Sample, after: &Sample, limits: &Limits) -> Repo
         &latest,
         after.pressure,
         delta,
+        cpu_busy_ratio,
         load1_per_core,
         limits,
         &mut reasons,
@@ -157,9 +173,10 @@ pub(crate) fn evaluate(before: &Sample, after: &Sample, limits: &Limits) -> Repo
         Verdict::Refuse
     };
     Report {
-        schema: 1,
+        schema: 2,
         verdict,
         reasons,
+        cpu_busy_ratio,
         load1_per_core,
         load1: latest.load.map(|[value, _, _]| value),
         load5: latest.load.map(|[_, value, _]| value),
@@ -179,11 +196,12 @@ fn record_refusals(
     latest: &Evidence,
     pressure: Option<PressureLevel>,
     delta: Option<u64>,
+    cpu_busy_ratio: Option<f64>,
     load_per_core: Option<f64>,
     limits: &Limits,
     reasons: &mut Vec<String>,
 ) {
-    // Stable severity order: thermal emergency, memory pressure, active swap, load.
+    // Stable severity order: thermal emergency, memory pressure, active swap, CPU.
     if let Some(level) = latest.thermal.filter(|level| *level >= limits.max_thermal) {
         reasons.push(format!("thermal {level} >= {}", limits.max_thermal));
     }
@@ -196,7 +214,11 @@ fn record_refusals(
     if let Some(pages) = delta.filter(|pages| *pages > 0 && !limits.allow_swapping) {
         reasons.push(format!("swapouts increased by {pages}"));
     }
-    if let Some(load) = load_per_core.filter(|value| *value > limits.max_load_per_core) {
+    if let Some(busy) = cpu_busy_ratio {
+        if busy > limits.max_cpu_busy {
+            reasons.push(format!("cpu busy {busy:.2} > {:.2}", limits.max_cpu_busy));
+        }
+    } else if let Some(load) = load_per_core.filter(|value| *value > limits.max_load_per_core) {
         reasons.push(format!(
             "load per core {load:.2} > {}",
             limits.max_load_per_core

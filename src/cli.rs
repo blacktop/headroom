@@ -14,7 +14,10 @@ pub(crate) struct Cli {
     /// Report format.
     #[arg(long, value_enum, default_value = "text")]
     pub(crate) format: Format,
-    /// Refuse when the one-minute load per core exceeds this value.
+    /// Refuse when the CPU busy ratio exceeds this value (0 to 1).
+    #[arg(long, default_value = "0.90", value_parser = parse_cpu_limit)]
+    pub(crate) max_cpu_busy: f64,
+    /// Fall back to this one-minute load limit when CPU ticks are unavailable.
     #[arg(long, default_value = "1.0", value_parser = parse_load_limit)]
     pub(crate) max_load_per_core: f64,
     /// Refuse at or above this thermal pressure level.
@@ -31,11 +34,21 @@ pub(crate) struct Cli {
 impl Cli {
     pub(crate) const fn limits(&self) -> crate::rule::Limits {
         crate::rule::Limits {
+            max_cpu_busy: self.max_cpu_busy,
             max_load_per_core: self.max_load_per_core,
             max_thermal: self.max_thermal,
             max_pressure: self.max_pressure,
             allow_swapping: self.allow_swapping,
         }
+    }
+}
+
+fn parse_cpu_limit(value: &str) -> Result<f64, &'static str> {
+    let parsed = value.parse::<f64>().map_err(|_| "expected a number")?;
+    if (0.0..=1.0).contains(&parsed) {
+        Ok(parsed)
+    } else {
+        Err("expected a number from 0 to 1")
     }
 }
 

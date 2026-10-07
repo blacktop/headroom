@@ -99,6 +99,8 @@ pub(crate) struct VmCounters {
 
 #[derive(Debug)]
 pub(crate) struct Sample {
+    /// Mach CPU ticks in SDK order: user, system, idle, nice.
+    pub(crate) cpu_ticks: Result<[u32; 4], ReadError>,
     pub(crate) load: Result<[f64; 3], ReadError>,
     pub(crate) ncpu: Result<u32, ReadError>,
     pub(crate) mem_total_bytes: Result<u64, ReadError>,
@@ -141,6 +143,7 @@ pub(crate) struct Report {
     pub(crate) schema: u8,
     pub(crate) verdict: Verdict,
     pub(crate) reasons: Vec<String>,
+    pub(crate) cpu_busy_ratio: Option<f64>,
     pub(crate) load1_per_core: Option<f64>,
     pub(crate) load1: Option<f64>,
     pub(crate) load5: Option<f64>,

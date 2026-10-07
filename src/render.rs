@@ -42,17 +42,27 @@ pub(crate) fn write(
 
 fn text(output: &mut impl Write, report: &Report) -> io::Result<()> {
     if report.verdict == Verdict::Admit {
-        writeln!(
+        write!(
             output,
-            "ADMIT: load {:.1} on {} cores, memory free {:.2}, thermal {}",
+            "ADMIT: cpu busy {:.2}, load {:.1} on {} cores, memory free {:.2}, thermal {}",
+            Nullable(report.cpu_busy_ratio),
             Nullable(report.load1),
             Nullable(report.ncpu),
             Nullable(report.mem_free_ratio),
             Nullable(report.thermal_level)
         )?;
     } else {
-        writeln!(output, "{}: {}", report.verdict, report.reasons.join("; "))?;
+        write!(output, "{}: {}", report.verdict, report.reasons.join("; "))?;
     }
+    if report.cpu_busy_ratio.is_none() {
+        write!(output, "; cpu ticks unavailable, using load fallback")?;
+    }
+    writeln!(output)?;
+    writeln!(
+        output,
+        "cpu_busy_ratio: {:.2}",
+        Nullable(report.cpu_busy_ratio)
+    )?;
     writeln!(
         output,
         "load1_per_core: {:.2}",
