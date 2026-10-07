@@ -23,5 +23,5 @@ _Static_assert(offsetof(vm_statistics64_data_t, speculative_count) == 92, "specu
 _Static_assert(offsetof(vm_statistics64_data_t, swapins) == 112, "swapins ABI");
 _Static_assert(offsetof(vm_statistics64_data_t, swapouts) == 120, "swapouts ABI");
 _Static_assert(offsetof(vm_statistics64_data_t, compressor_page_count) == 128, "compressor ABI");
-_Static_assert(offsetof(vm_statistics64_data_t, swapped_count) == 152, "VM rev1 ABI");
+_Static_assert(offsetof(vm_statistics64_data_t, total_uncompressed_pages_in_compressor) == 144, "VM rev1 tail ABI");
 _Static_assert(HOST_VM_INFO64_REV1_COUNT == 38, "VM rev1 word count");
