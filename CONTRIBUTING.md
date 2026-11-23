@@ -48,11 +48,12 @@ The release binary should link only to libSystem.
 ## Code layout
 
 The [sampler](src/sample.rs) uses `getloadavg`, `sysctlbyname`,
-`host_statistics`, `host_statistics64`, and the public thermal-pressure
-notification. The
+`host_statistics`, `host_statistics64`, `statfs`, and the public
+thermal-pressure notification. The
 [verdict rule](src/rule.rs) takes plain samples, so its tests do not depend on
 how busy the test machine is. The [SDK contract](tests/sdk_contract.m) checks
-the thermal constants and CPU/VM layouts against Apple's installed headers.
+the thermal constants and CPU/VM/`statfs` layouts against Apple's installed
+headers.
 
 ## Releases
 

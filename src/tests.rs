@@ -4,14 +4,20 @@
 )]
 
 use std::error::Error;
+use std::ffi::{OsStr, OsString};
 use std::io;
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 
 use clap::Parser;
 use serde_json::json;
 
 use crate::cli::{Cli, Format};
-use crate::model::{PressureLevel, ReadError, Sample, ThermalLevel, Verdict, VmCounters};
+use crate::model::{
+    BYTES_PER_GIB, PressureLevel, ReadError, Sample, ThermalLevel, Verdict, VmCounters,
+};
 use crate::rule::{Limits, evaluate};
+use crate::sample::{available_bytes, disk_free_bytes, home_directory};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -41,6 +47,7 @@ fn sample() -> Sample {
         thermal: Ok(ThermalLevel::Nominal),
         swap_used_bytes: None,
         pressure: None,
+        disk_free_bytes: Ok(400 * BYTES_PER_GIB),
     }
 }
 
@@ -231,6 +238,7 @@ fn every_triggered_reason_is_reported_in_severity_order() -> TestResult {
     vm(&mut after)?.swapouts = 25;
     after.cpu_ticks = Ok([75, 10, 5, 10]);
     after.load = Ok([32.0, 0.0, 0.0]);
+    after.disk_free_bytes = Ok(BYTES_PER_GIB / 2);
     let report = evaluate(&sample(), &after, &Limits::default());
     assert_eq!(report.verdict, Verdict::Refuse);
     assert_eq!(
@@ -240,8 +248,188 @@ fn every_triggered_reason_is_reported_in_severity_order() -> TestResult {
             "memory pressure critical >= warn",
             "swapouts increased by 3",
             "cpu busy 0.95 > 0.90",
+            "disk free 0.50 GiB < 150.00 GiB",
         ]
     );
+    Ok(())
+}
+
+#[test]
+fn disk_threshold_refuses_below_the_minimum_and_is_configurable() {
+    let minimum = Limits::default().min_free_disk_bytes;
+    assert_eq!(minimum, 150 * BYTES_PER_GIB);
+    for (free, expected) in [
+        (0, Verdict::Refuse),
+        (minimum - 1, Verdict::Refuse),
+        (minimum, Verdict::Admit),
+        (minimum + 1, Verdict::Admit),
+        (u64::MAX, Verdict::Admit),
+    ] {
+        let mut after = after_sample();
+        after.disk_free_bytes = Ok(free);
+        let report = evaluate(&sample(), &after, &Limits::default());
+        assert_eq!(report.verdict, expected, "free {free}");
+        assert_eq!(report.disk_free_bytes, Some(free));
+    }
+    let mut after = after_sample();
+    after.disk_free_bytes = Ok(149 * BYTES_PER_GIB);
+    assert_eq!(
+        evaluate(&sample(), &after, &Limits::default()).reasons,
+        ["disk free 149.00 GiB < 150.00 GiB"]
+    );
+    let limits = Limits {
+        min_free_disk_bytes: 149 * BYTES_PER_GIB,
+        ..Limits::default()
+    };
+    assert_eq!(evaluate(&sample(), &after, &limits).verdict, Verdict::Admit);
+    let limits = Limits {
+        min_free_disk_bytes: 500 * BYTES_PER_GIB,
+        ..Limits::default()
+    };
+    let report = evaluate(&sample(), &after_sample(), &limits);
+    assert_eq!(report.verdict, Verdict::Refuse);
+    assert_eq!(report.reasons, ["disk free 400.00 GiB < 500.00 GiB"]);
+}
+
+#[test]
+fn disk_rule_reads_the_latest_sample() {
+    let mut before = sample();
+    before.disk_free_bytes = Ok(0);
+    let report = evaluate(&before, &after_sample(), &Limits::default());
+    assert_eq!(report.verdict, Verdict::Admit);
+    assert_eq!(report.disk_free_bytes, Some(400 * BYTES_PER_GIB));
+}
+
+#[test]
+fn zero_minimum_disables_the_disk_rule() -> TestResult {
+    let limits = Limits {
+        min_free_disk_bytes: 0,
+        ..Limits::default()
+    };
+    let mut after = after_sample();
+    after.disk_free_bytes = Ok(0);
+    let report = evaluate(&sample(), &after, &limits);
+    assert_eq!(report.verdict, Verdict::Admit);
+    assert_eq!(report.disk_free_bytes, Some(0));
+
+    let mut before = sample();
+    before.disk_free_bytes = Err(denied());
+    after.disk_free_bytes = Err(denied());
+    let report = evaluate(&before, &after, &limits);
+    assert_eq!(report.verdict, Verdict::Admit);
+    assert_eq!(report.reasons, Vec::<String>::new());
+    assert_eq!(report.disk_free_bytes, None);
+    let mut output = Vec::new();
+    crate::render::write(&mut output, &report, Format::Text)?;
+    let text = String::from_utf8(output)?;
+    assert!(
+        text.lines()
+            .next()
+            .is_some_and(|line| line.ends_with(", disk free null GiB"))
+    );
+    assert!(text.ends_with("\ndisk_free_bytes: null\n"));
+    Ok(())
+}
+
+#[test]
+fn unreadable_disk_is_unknown_while_the_rule_is_enabled() -> TestResult {
+    for first_missing in [true, false] {
+        let mut before = sample();
+        let mut after = after_sample();
+        let phase = if first_missing {
+            before.disk_free_bytes = Err(denied());
+            "first"
+        } else {
+            after.disk_free_bytes = Err(denied());
+            "second"
+        };
+        let report = evaluate(&before, &after, &Limits::default());
+        assert_eq!(report.verdict, Verdict::Unknown, "first={first_missing}");
+        assert_eq!(
+            report.reasons,
+            [format!(
+                "{phase} free disk space unavailable: injected read: Operation not permitted \
+                 (os error 1)"
+            )]
+        );
+    }
+    let mut after = after_sample();
+    after.disk_free_bytes = Err(denied());
+    after.thermal = Ok(ThermalLevel::Heavy);
+    let report = evaluate(&sample(), &after, &Limits::default());
+    assert_eq!(report.verdict, Verdict::Unknown);
+    assert_eq!(report.disk_free_bytes, None);
+    let value = serde_json::to_value(report)?;
+    assert_eq!(value.get("disk_free_bytes"), Some(&serde_json::Value::Null));
+    Ok(())
+}
+
+#[test]
+fn disk_reader_reports_a_real_volume_and_names_an_unreadable_path() -> TestResult {
+    disk_free_bytes(Some(Path::new("/")))?;
+
+    let missing = Path::new("/nonexistent/headroom-disk-rule-test");
+    let Err(error) = disk_free_bytes(Some(missing)) else {
+        return Err("a missing path must not produce a free-space reading".into());
+    };
+    assert_eq!(
+        error.to_string(),
+        "statfs /nonexistent/headroom-disk-rule-test: No such file or directory (os error 2)"
+    );
+
+    let embedded_nul = Path::new(OsStr::from_bytes(b"/tmp\0/x"));
+    let Err(error) = disk_free_bytes(Some(embedded_nul)) else {
+        return Err("a path with a NUL byte must not reach statfs".into());
+    };
+    assert_eq!(error.to_string(), "disk path contains a NUL byte");
+    Ok(())
+}
+
+#[test]
+fn unreadable_disk_path_makes_the_default_rule_unknown() {
+    let missing = Path::new("/nonexistent/headroom-disk-rule-test");
+    let mut after = after_sample();
+    after.disk_free_bytes = disk_free_bytes(Some(missing));
+    let report = evaluate(&sample(), &after, &Limits::default());
+    assert_eq!(report.verdict, Verdict::Unknown);
+    assert_eq!(report.verdict.code(), 2);
+    assert_eq!(
+        report.reasons,
+        [
+            "second free disk space unavailable: statfs /nonexistent/headroom-disk-rule-test: \
+             No such file or directory (os error 2)"
+        ]
+    );
+}
+
+#[test]
+fn available_disk_bytes_use_checked_arithmetic() -> TestResult {
+    assert_eq!(available_bytes(0, 4096)?, 0);
+    assert_eq!(available_bytes(262_144, 4096)?, BYTES_PER_GIB);
+    assert_eq!(available_bytes(u64::MAX, 1)?, u64::MAX);
+    let Err(error) = available_bytes(u64::MAX, 2) else {
+        return Err("an overflowing byte count must be rejected".into());
+    };
+    assert_eq!(error.to_string(), "free disk byte count overflow");
+    assert!(available_bytes(1 << 52, 4096).is_err());
+    Ok(())
+}
+
+#[test]
+fn default_disk_path_needs_a_non_empty_home() -> TestResult {
+    assert_eq!(
+        home_directory(Some("/Users/worker".into()))?,
+        Path::new("/Users/worker")
+    );
+    for home in [None, Some(OsString::new())] {
+        let Err(error) = home_directory(home) else {
+            return Err("an unset or empty HOME must not yield a disk path".into());
+        };
+        assert_eq!(
+            error.to_string(),
+            "home directory unavailable; pass --disk-path"
+        );
+    }
     Ok(())
 }
 
@@ -390,6 +578,10 @@ fn mach_binding_fields_match_the_sdk_contract() {
     assert_eq!(size_of::<libc::host_cpu_load_info>(), 16);
     assert_eq!(align_of::<libc::host_cpu_load_info>(), 4);
     assert_eq!(offset_of!(libc::host_cpu_load_info, cpu_ticks), 0);
+    assert_eq!(size_of::<libc::statfs>(), 2168);
+    assert_eq!(align_of::<libc::statfs>(), 8);
+    assert_eq!(offset_of!(libc::statfs, f_bsize), 0);
+    assert_eq!(offset_of!(libc::statfs, f_bavail), 24);
 }
 
 #[test]
@@ -400,12 +592,14 @@ fn text_report_has_the_documented_keys_order_and_precision() -> TestResult {
     assert_eq!(
         String::from_utf8(output)?,
         concat!(
-            "ADMIT: cpu busy 0.75, load 4.0 on 16 cores, memory free 0.50, thermal nominal\n",
+            "ADMIT: cpu busy 0.75, load 4.0 on 16 cores, memory free 0.50, thermal nominal, ",
+            "disk free 400.0 GiB\n",
             "cpu_busy_ratio: 0.75\n",
             "load1_per_core: 0.25\nload1: 4.0\nload5: 6.0\nload15: 12.0\n",
             "ncpu: 16\nmem_total_bytes: 16384000\nmem_free_ratio: 0.50\n",
             "compressor_bytes: 1638400\nswapouts_delta: 0\nswap_used_bytes: null\n",
             "pressure_level: null\nthermal_level: nominal\n",
+            "disk_free_bytes: 429496729600\n",
         )
     );
     Ok(())
@@ -431,8 +625,34 @@ fn json_report_is_one_flat_versioned_object_with_exact_integers() -> TestResult 
             "compressor_bytes": 1_638_400, "swapouts_delta": 0,
             "swap_used_bytes": 9_007_199_254_740_993_u64,
             "pressure_level": "normal", "thermal_level": "nominal",
+            "disk_free_bytes": 429_496_729_600_u64,
         })
     );
+    Ok(())
+}
+
+#[test]
+fn json_report_appends_free_disk_bytes_after_the_existing_fields() -> TestResult {
+    let mut after = after_sample();
+    after.disk_free_bytes = Ok(9_007_199_254_740_993);
+    let report = evaluate(&sample(), &after, &Limits::default());
+    let mut output = Vec::new();
+    crate::render::write(&mut output, &report, Format::Json)?;
+    let text = String::from_utf8(output)?;
+    assert!(text.starts_with(r#"{"schema":2,"verdict":"ADMIT","reasons":[],"cpu_busy_ratio":"#));
+    assert!(
+        text.ends_with("\"thermal_level\":\"nominal\",\"disk_free_bytes\":9007199254740993}\n")
+    );
+
+    after.disk_free_bytes = Ok(BYTES_PER_GIB);
+    let report = evaluate(&sample(), &after, &Limits::default());
+    let value = serde_json::to_value(report)?;
+    assert_eq!(value.get("verdict"), Some(&json!("REFUSE")));
+    assert_eq!(
+        value.get("reasons"),
+        Some(&json!(["disk free 1.00 GiB < 150.00 GiB"]))
+    );
+    assert_eq!(value.get("disk_free_bytes"), Some(&json!(BYTES_PER_GIB)));
     Ok(())
 }
 
@@ -474,7 +694,7 @@ fn verdict_text_identifies_the_load_fallback() -> TestResult {
         (
             Ok([4.0, 6.0, 12.0]),
             Ok(ThermalLevel::Nominal),
-            "ADMIT: cpu busy null, load 4.0 on 16 cores, memory free 0.50, thermal nominal; cpu ticks unavailable, using load fallback",
+            "ADMIT: cpu busy null, load 4.0 on 16 cores, memory free 0.50, thermal nominal, disk free 400.0 GiB; cpu ticks unavailable, using load fallback",
         ),
         (
             Ok([32.0, 0.0, 0.0]),
@@ -511,7 +731,75 @@ fn cli_defaults_match_the_rule_defaults() -> TestResult {
     assert_eq!(cli.max_thermal, limits.max_thermal);
     assert_eq!(cli.max_pressure, limits.max_pressure);
     assert_eq!(cli.allow_swapping, limits.allow_swapping);
+    assert_eq!(cli.min_free_disk, limits.min_free_disk_bytes);
+    assert_eq!(cli.limits().min_free_disk_bytes, 150 * BYTES_PER_GIB);
+    assert_eq!(cli.disk_path, None);
     Ok(())
+}
+
+#[test]
+fn cli_parses_byte_counts_and_binary_size_suffixes() -> TestResult {
+    for (size, bytes) in [
+        ("0", 0),
+        ("1", 1),
+        ("161061273600", 150 << 30),
+        ("4K", 4 << 10),
+        ("4KiB", 4 << 10),
+        ("500M", 500 << 20),
+        ("500MiB", 500 << 20),
+        ("150G", 150 << 30),
+        ("150GiB", 150 << 30),
+        ("2T", 2 << 40),
+        ("2TiB", 2 << 40),
+        ("0G", 0),
+        ("18446744073709551615", u64::MAX),
+        ("16777215T", 16_777_215 << 40),
+    ] {
+        let cli = Cli::try_parse_from(["headroom", "--min-free-disk", size])?;
+        assert_eq!(cli.min_free_disk, bytes, "size {size}");
+        assert_eq!(cli.limits().min_free_disk_bytes, bytes, "size {size}");
+    }
+    Ok(())
+}
+
+#[test]
+fn cli_rejects_malformed_and_oversized_sizes() {
+    for size in [
+        "",
+        "G",
+        "GiB",
+        "abc",
+        "-1",
+        "+5",
+        "1.5G",
+        "1e3",
+        "0x10",
+        "150 G",
+        " 150G",
+        "150g",
+        "150gib",
+        "150GB",
+        "150Gi",
+        "150GiBB",
+        "150P",
+        "150G1",
+        "18446744073709551616",
+        "16777216T",
+        "17179869184G",
+    ] {
+        let result =
+            Cli::try_parse_from(["headroom".to_owned(), format!("--min-free-disk={size}")]);
+        assert!(result.is_err(), "size {size:?}");
+        if let Err(error) = result {
+            assert_eq!(error.exit_code(), 2);
+            let message = error.to_string();
+            assert!(
+                message.contains("expected a byte count or a binary size")
+                    || message.contains("size does not fit in a 64-bit byte count"),
+                "size {size:?}: {message}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -553,7 +841,13 @@ fn cli_accepts_every_documented_threshold_flag() -> TestResult {
         "--max-pressure",
         "critical",
         "--allow-swapping",
+        "--min-free-disk",
+        "20GiB",
+        "--disk-path",
+        "/Volumes/Build",
     ])?;
+    assert_eq!(cli.min_free_disk, 20 * BYTES_PER_GIB);
+    assert_eq!(cli.disk_path.as_deref(), Some(Path::new("/Volumes/Build")));
     assert_eq!(cli.format, Format::Json);
     assert_eq!(cli.max_thermal, ThermalLevel::Sleeping);
     assert_eq!(cli.max_pressure, PressureLevel::Critical);

@@ -19,9 +19,10 @@ pub(crate) fn run() -> Result<ExitCode, RenderError> {
             return Ok(ExitCode::SUCCESS);
         }
     };
-    let before = crate::sample::take();
+    let disk_path = options.disk_path.as_deref();
+    let before = crate::sample::take(disk_path);
     std::thread::sleep(Duration::from_secs(1));
-    let after = crate::sample::take();
+    let after = crate::sample::take(disk_path);
     let report = crate::rule::evaluate(&before, &after, &options.limits());
     let mut output = io::stdout().lock();
     crate::render::write(&mut output, &report, options.format)?;

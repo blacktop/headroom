@@ -1,4 +1,7 @@
-use crate::model::{PressureLevel, ReadError, Report, Sample, ThermalLevel, Verdict, VmCounters};
+use crate::model::{
+    BYTES_PER_GIB, PressureLevel, ReadError, Report, Sample, ThermalLevel, Verdict, VmCounters,
+    gibibytes,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Limits {
@@ -7,6 +10,8 @@ pub(crate) struct Limits {
     pub(crate) max_thermal: ThermalLevel,
     pub(crate) max_pressure: PressureLevel,
     pub(crate) allow_swapping: bool,
+    /// Zero disables the free-disk rule.
+    pub(crate) min_free_disk_bytes: u64,
 }
 
 impl Default for Limits {
@@ -17,6 +22,7 @@ impl Default for Limits {
             max_thermal: ThermalLevel::Heavy,
             max_pressure: PressureLevel::Warn,
             allow_swapping: false,
+            min_free_disk_bytes: 150 * BYTES_PER_GIB,
         }
     }
 }
@@ -28,6 +34,7 @@ struct Evidence {
     vm: Option<VmCounters>,
     memory: Option<(f64, u64)>,
     thermal: Option<ThermalLevel>,
+    disk_free_bytes: Option<u64>,
 }
 
 fn required<T: Copy>(
@@ -46,7 +53,7 @@ fn required<T: Copy>(
 }
 
 impl Evidence {
-    fn read(sample: &Sample, phase: &str, unavailable: &mut Vec<String>) -> Self {
+    fn read(sample: &Sample, phase: &str, limits: &Limits, unavailable: &mut Vec<String>) -> Self {
         let load = sample.load.as_ref().ok().copied();
         let load = if load.is_some_and(|values| {
             values
@@ -82,6 +89,17 @@ impl Evidence {
                     }
                 });
         let thermal = required(&sample.thermal, phase, "thermal state", unavailable);
+        // A disabled rule cannot refuse, so its evidence is optional like swap usage.
+        let disk_free_bytes = if limits.min_free_disk_bytes == 0 {
+            sample.disk_free_bytes.as_ref().ok().copied()
+        } else {
+            required(
+                &sample.disk_free_bytes,
+                phase,
+                "free disk space",
+                unavailable,
+            )
+        };
         Self {
             load,
             ncpu,
@@ -89,6 +107,7 @@ impl Evidence {
             vm,
             memory,
             thermal,
+            disk_free_bytes,
         }
     }
 }
@@ -147,8 +166,8 @@ fn cpu_busy_ratio(before: &Sample, after: &Sample) -> Option<f64> {
 
 pub(crate) fn evaluate(before: &Sample, after: &Sample, limits: &Limits) -> Report {
     let mut reasons = Vec::new();
-    let first = Evidence::read(before, "first", &mut reasons);
-    let latest = Evidence::read(after, "second", &mut reasons);
+    let first = Evidence::read(before, "first", limits, &mut reasons);
+    let latest = Evidence::read(after, "second", limits, &mut reasons);
     let delta = swap_delta(&first, &latest, &mut reasons);
     let cpu_busy_ratio = cpu_busy_ratio(before, after);
     let load1_per_core = latest
@@ -189,6 +208,7 @@ pub(crate) fn evaluate(before: &Sample, after: &Sample, limits: &Limits) -> Repo
         swap_used_bytes: after.swap_used_bytes,
         pressure_level: after.pressure,
         thermal_level: latest.thermal,
+        disk_free_bytes: latest.disk_free_bytes,
     }
 }
 
@@ -201,7 +221,8 @@ fn record_refusals(
     limits: &Limits,
     reasons: &mut Vec<String>,
 ) {
-    // Stable severity order: thermal emergency, memory pressure, active swap, CPU.
+    // Stable order: thermal emergency, memory pressure, active swap, CPU, then
+    // disk, which is last so the reasons that predate it keep their positions.
     if let Some(level) = latest.thermal.filter(|level| *level >= limits.max_thermal) {
         reasons.push(format!("thermal {level} >= {}", limits.max_thermal));
     }
@@ -222,6 +243,16 @@ fn record_refusals(
         reasons.push(format!(
             "load per core {load:.2} > {}",
             limits.max_load_per_core
+        ));
+    }
+    if let Some(free) = latest
+        .disk_free_bytes
+        .filter(|free| *free < limits.min_free_disk_bytes)
+    {
+        reasons.push(format!(
+            "disk free {:.2} GiB < {:.2} GiB",
+            gibibytes(free),
+            gibibytes(limits.min_free_disk_bytes)
         ));
     }
 }

@@ -1,9 +1,20 @@
 use std::fmt;
 use std::io;
+use std::path::PathBuf;
 
 use clap::ValueEnum;
 use serde::Serialize;
 use thiserror::Error;
+
+pub(crate) const BYTES_PER_GIB: u64 = 1 << 30;
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "display value only; byte counts stay integers"
+)]
+pub(crate) fn gibibytes(bytes: u64) -> f64 {
+    bytes as f64 / BYTES_PER_GIB as f64
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -79,6 +90,12 @@ pub(crate) enum ReadError {
         operation: &'static str,
         source: io::Error,
     },
+    #[error("{operation} {}: {source}", path.display())]
+    Path {
+        operation: &'static str,
+        path: PathBuf,
+        source: io::Error,
+    },
     #[error("{operation}: status {code}")]
     Status { operation: &'static str, code: i64 },
     #[error("{0}")]
@@ -108,6 +125,8 @@ pub(crate) struct Sample {
     pub(crate) thermal: Result<ThermalLevel, ReadError>,
     pub(crate) swap_used_bytes: Option<u64>,
     pub(crate) pressure: Option<PressureLevel>,
+    /// Bytes available to the current user on the measured volume.
+    pub(crate) disk_free_bytes: Result<u64, ReadError>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -156,4 +175,6 @@ pub(crate) struct Report {
     pub(crate) swap_used_bytes: Option<u64>,
     pub(crate) pressure_level: Option<PressureLevel>,
     pub(crate) thermal_level: Option<ThermalLevel>,
+    // Appended last so the fields above keep the order existing consumers see.
+    pub(crate) disk_free_bytes: Option<u64>,
 }

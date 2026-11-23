@@ -6,6 +6,7 @@
 #include <mach/machine.h>
 #include <mach/vm_statistics.h>
 #include <stddef.h>
+#include <sys/mount.h>
 
 _Static_assert(kOSThermalPressureLevelNominal == 0, "nominal ABI");
 _Static_assert(kOSThermalPressureLevelModerate == 1, "moderate ABI");
@@ -35,3 +36,9 @@ _Static_assert(offsetof(vm_statistics64_data_t, swapouts) == 120, "swapouts ABI"
 _Static_assert(offsetof(vm_statistics64_data_t, compressor_page_count) == 128, "compressor ABI");
 _Static_assert(offsetof(vm_statistics64_data_t, total_uncompressed_pages_in_compressor) == 144, "VM rev1 tail ABI");
 _Static_assert(HOST_VM_INFO64_REV1_COUNT == 38, "VM rev1 word count");
+_Static_assert(sizeof(struct statfs) == 2168, "statfs buffer size");
+_Static_assert(_Alignof(struct statfs) == 8, "statfs buffer alignment");
+_Static_assert(offsetof(struct statfs, f_bsize) == 0, "statfs block size ABI");
+_Static_assert(sizeof(((struct statfs *)0)->f_bsize) == 4, "statfs block size width");
+_Static_assert(offsetof(struct statfs, f_bavail) == 24, "statfs available blocks ABI");
+_Static_assert(sizeof(((struct statfs *)0)->f_bavail) == 8, "statfs available blocks width");

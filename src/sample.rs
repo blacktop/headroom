@@ -1,6 +1,8 @@
-use std::ffi::CStr;
+use std::ffi::{CStr, CString, OsString};
 use std::io;
 use std::mem::{MaybeUninit, offset_of, size_of};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::ptr;
 
 use mach2::host_info::HOST_VM_INFO64_COUNT;
@@ -33,7 +35,8 @@ unsafe extern "C" {
     fn notify_cancel(token: libc::c_int) -> u32;
 }
 
-pub(crate) fn take() -> Sample {
+/// Read one sample; `disk_path` of `None` measures the home directory's volume.
+pub(crate) fn take(disk_path: Option<&Path>) -> Sample {
     Sample {
         cpu_ticks: cpu_ticks(),
         load: load(),
@@ -43,6 +46,7 @@ pub(crate) fn take() -> Sample {
         thermal: thermal(),
         swap_used_bytes: swap_used_bytes().ok(),
         pressure: pressure().ok(),
+        disk_free_bytes: disk_free_bytes(disk_path),
     }
 }
 
@@ -121,6 +125,52 @@ fn pressure() -> Result<PressureLevel, ReadError> {
         )
     }?;
     PressureLevel::from_raw(value)
+}
+
+pub(crate) fn disk_free_bytes(path: Option<&Path>) -> Result<u64, ReadError> {
+    let path = match path {
+        Some(path) => path.to_path_buf(),
+        None => home_directory(std::env::var_os("HOME"))?,
+    };
+    let name = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| ReadError::Invalid("disk path contains a NUL byte"))?;
+    // statfs rather than statvfs: Darwin's statvfs block counts are 32-bit and
+    // wrap on volumes above 16 TiB, while statfs reports them as 64-bit.
+    let mut info = MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: name is a terminated C string that outlives the call. info is an
+    // aligned, exclusive buffer with libc's SDK layout for struct statfs. The
+    // synchronous call only reads the file system, retains neither pointer, and
+    // cannot unwind across the C ABI.
+    let result = unsafe { libc::statfs(name.as_ptr(), info.as_mut_ptr()) };
+    if result != 0 {
+        let source = io::Error::last_os_error();
+        return Err(ReadError::Path {
+            operation: "statfs",
+            path,
+            source,
+        });
+    }
+    // SAFETY: A zero return means the kernel filled the whole structure, whose
+    // fields are plain integers and byte arrays valid for every bit pattern.
+    let info = unsafe { info.assume_init() };
+    available_bytes(info.f_bavail, info.f_bsize)
+}
+
+// HOME arrives as a parameter so tests need not mutate the process environment.
+// `std::env::home_dir` is avoided: it is deprecated on the declared minimum
+// toolchain, which would fail a warnings-denied build there.
+pub(crate) fn home_directory(home: Option<OsString>) -> Result<PathBuf, ReadError> {
+    home.filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .ok_or(ReadError::Invalid(
+            "home directory unavailable; pass --disk-path",
+        ))
+}
+
+pub(crate) fn available_bytes(blocks: u64, block_size: u32) -> Result<u64, ReadError> {
+    blocks
+        .checked_mul(u64::from(block_size))
+        .ok_or(ReadError::Invalid("free disk byte count overflow"))
 }
 
 fn load() -> Result<[f64; 3], ReadError> {

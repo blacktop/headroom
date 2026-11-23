@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use thiserror::Error;
 
 use crate::cli::Format;
-use crate::model::{Report, Verdict};
+use crate::model::{Report, Verdict, gibibytes};
 
 #[derive(Debug, Error)]
 pub(crate) enum RenderError {
@@ -44,12 +44,14 @@ fn text(output: &mut impl Write, report: &Report) -> io::Result<()> {
     if report.verdict == Verdict::Admit {
         write!(
             output,
-            "ADMIT: cpu busy {:.2}, load {:.1} on {} cores, memory free {:.2}, thermal {}",
+            "ADMIT: cpu busy {:.2}, load {:.1} on {} cores, memory free {:.2}, thermal {}, \
+             disk free {:.1} GiB",
             Nullable(report.cpu_busy_ratio),
             Nullable(report.load1),
             Nullable(report.ncpu),
             Nullable(report.mem_free_ratio),
-            Nullable(report.thermal_level)
+            Nullable(report.thermal_level),
+            Nullable(report.disk_free_bytes.map(gibibytes))
         )?;
     } else {
         write!(output, "{}: {}", report.verdict, report.reasons.join("; "))?;
@@ -102,5 +104,10 @@ fn text(output: &mut impl Write, report: &Report) -> io::Result<()> {
         "pressure_level: {}",
         Nullable(report.pressure_level)
     )?;
-    writeln!(output, "thermal_level: {}", Nullable(report.thermal_level))
+    writeln!(output, "thermal_level: {}", Nullable(report.thermal_level))?;
+    writeln!(
+        output,
+        "disk_free_bytes: {}",
+        Nullable(report.disk_free_bytes)
+    )
 }
