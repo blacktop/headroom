@@ -56,6 +56,7 @@ homebrew_casks:
     description: Read-only macOS worker admission check
     license: MIT
     custom_block: |
+      depends_on :macos
       postflight_steps do
         on_macos do
           run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ "{{staged_path}}" }}/headroom"]
